@@ -102,8 +102,15 @@ class TestRouter:
         assert decision.complexity == TaskComplexity.CRITICAL
 
     def test_moderate_message(self, router_default):
-        decision = router_default.route("Summarize my emails from today")
+        decision = router_default.route(
+            "Summarize my emails from today and flag anything that needs a reply"
+        )
         assert decision.complexity == TaskComplexity.MODERATE
+
+    def test_short_task_message_is_simple(self, router_default):
+        """Short single-step requests ride the fast tier."""
+        decision = router_default.route("Summarize my emails from today")
+        assert decision.complexity == TaskComplexity.SIMPLE
 
     def test_force_model(self, router_default):
         decision = router_default.route("hello", force_model="openai:gpt-4o")
