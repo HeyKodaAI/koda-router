@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class TaskComplexity(str, Enum):
@@ -94,9 +94,11 @@ class UsageRecord(BaseModel):
 class RoutingConfig(BaseModel):
     """User-configurable routing preferences."""
 
+    model_config = ConfigDict(validate_assignment=True)
+
     # Budget
-    daily_budget: float = Field(default=5.0, description="Max daily spend in $")
-    per_request_budget: float = Field(default=0.50, description="Max cost per request in $")
+    daily_budget: float = Field(default=5.0, ge=0, allow_inf_nan=False, description="Max daily spend in $")
+    per_request_budget: float = Field(default=0.50, ge=0, allow_inf_nan=False, description="Max cost per request in $")
 
     # Model preferences
     preferred_provider: Optional[str] = Field(

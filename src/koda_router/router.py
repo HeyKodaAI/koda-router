@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from koda_router.catalog import ALL_MODELS, list_models
 from koda_router.models import (
@@ -71,12 +71,25 @@ _COMPLEXITY_TO_TIER = {
 }
 
 
+class RoutingError(ValueError):
+    """No model satisfies the configured capability, provider or budget policy."""
+
+
 class ModelRouter:
     """Selects the best model for a given request."""
 
     def __init__(self, config: Optional[RoutingConfig] = None) -> None:
         self._config = config or RoutingConfig()
         self._daily_spend = 0.0
+        self._daily_spend_provider: Callable[[], float] | None = None
+
+    def set_daily_spend_provider(self, provider: Callable[[], float]) -> None:
+        """Use authoritative daily usage (e.g. RoutingStorage.get_daily_cost).
+
+        The host must persist usage to that source; record_usage only updates
+        the built-in in-memory counter used when no provider is installed.
+        """
+        self._daily_spend_provider = provider
 
     @property
     def config(self) -> RoutingConfig:
@@ -106,88 +119,50 @@ class ModelRouter:
         Returns:
             RoutingDecision with the selected model and reasoning
         """
-        # 1. Force override
-        if force_model and force_model in ALL_MODELS:
-            model = ALL_MODELS[force_model]
-            return RoutingDecision(
-                model=model,
-                reason=f"Forced model: {model.display_name}",
-                complexity=TaskComplexity.MODERATE,
-            )
-
-        # 2. Forced provider override
-        if self._config.preferred_provider:
-            return self._route_with_provider(
-                message, self._config.preferred_provider, has_tools, has_images, latency
-            )
-
-        # 3. Estimate complexity
         complexity = self.estimate_complexity(message, has_tools)
-
-        # 4. Determine target tier
-        if self._config.preferred_tier:
-            target_tier = self._config.preferred_tier
-        elif self._config.auto_downgrade and complexity == TaskComplexity.SIMPLE:
-            target_tier = ModelTier.FAST
-        elif self._config.auto_upgrade and complexity in (
-            TaskComplexity.COMPLEX,
-            TaskComplexity.CRITICAL,
-        ):
-            target_tier = ModelTier.POWERFUL
-        elif not self._config.auto_downgrade and complexity == TaskComplexity.SIMPLE:
-            target_tier = ModelTier.BALANCED
+        provider = self._config.preferred_provider
+        compatible = [m for m in ALL_MODELS.values() if m.enabled
+                      and (not provider or m.provider == provider)
+                      and (not has_tools or m.supports_tools)
+                      and (not has_images or m.supports_vision)]
+        if not compatible:
+            raise RoutingError("No compatible model satisfies the provider and capability requirements")
+        budget = min(self._config.per_request_budget, self.budget_remaining)
+        affordable = [m for m in compatible if self._estimate_cost(m, message) <= budget]
+        if force_model:
+            candidates = [m for m in affordable if m.id == force_model]
+            if not candidates:
+                raise RoutingError("Forced model is unknown, unavailable, incompatible or over budget")
+            model = candidates[0]
+            reason = f"Forced model: {model.display_name}"
         else:
-            target_tier = _COMPLEXITY_TO_TIER.get(complexity, ModelTier.BALANCED)
-
-        # 5. Find best model in target tier
-        candidates = self._get_candidates(target_tier, has_tools, has_images)
-
-        if not candidates:
-            # Fallback: try balanced tier
-            candidates = self._get_candidates(ModelTier.BALANCED, has_tools, has_images)
-
-        if not candidates:
-            # Last resort: any available model
-            candidates = [m for m in ALL_MODELS.values() if m.enabled]
-
-        if not candidates:
-            # Absolute fallback
-            model = list(ALL_MODELS.values())[0]
-            return RoutingDecision(
-                model=model,
-                reason="No suitable model found, using default",
-                complexity=complexity,
-            )
-
-        # 6. Sort by preference: provider fallback order, then cost
-        model = self._select_best(candidates)
-
-        # 7. Budget check
-        estimated_cost = self._estimate_cost(model, message)
-        if estimated_cost > self._config.per_request_budget:
-            # Try a cheaper model
-            cheaper = [
-                m for m in self._get_candidates(ModelTier.FAST, has_tools, has_images)
-                if self._estimate_cost(m, message) <= self._config.per_request_budget
-            ]
-            if cheaper:
-                model = self._select_best(cheaper)
-                estimated_cost = self._estimate_cost(model, message)
-
-        # 8. Build fallback chain
-        fallbacks = [
-            m.id
-            for m in ALL_MODELS.values()
-            if m.id != model.id and m.enabled and m.tier == model.tier
-        ]
-
-        return RoutingDecision(
-            model=model,
-            reason=self._build_reason(model, complexity, target_tier),
-            complexity=complexity,
-            estimated_cost=round(estimated_cost, 6),
-            fallback_models=fallbacks[:3],
-        )
+            if not affordable:
+                raise RoutingError("No compatible model fits the remaining daily and per-request budget")
+            if self._config.preferred_tier:
+                target_tier = self._config.preferred_tier
+            elif complexity == TaskComplexity.SIMPLE:
+                target_tier = ModelTier.FAST if self._config.auto_downgrade else ModelTier.BALANCED
+            elif complexity in (TaskComplexity.COMPLEX, TaskComplexity.CRITICAL):
+                target_tier = ModelTier.POWERFUL if self._config.auto_upgrade else ModelTier.BALANCED
+            else:
+                target_tier = ModelTier.BALANCED
+            candidates = [m for m in affordable if m.tier == target_tier]
+            if not candidates:
+                candidates = [m for m in affordable if m.tier == ModelTier.BALANCED]
+            model = self._select_best(candidates or affordable)
+            reason = self._build_reason(model, complexity, target_tier)
+            if provider:
+                reason = f"Forced provider: {provider}; " + reason
+        fallbacks = []
+        if self._config.fallback_enabled:
+            remaining = [m for m in affordable if m.id != model.id and m.tier == model.tier]
+            while remaining and len(fallbacks) < 3:
+                best = self._select_best(remaining)
+                fallbacks.append(best.id)
+                remaining = [m for m in remaining if m.id != best.id]
+        return RoutingDecision(model=model, reason=reason, complexity=complexity,
+                               estimated_cost=round(self._estimate_cost(model, message), 6),
+                               fallback_models=fallbacks)
 
     def estimate_complexity(self, message: str, has_tools: bool = False) -> TaskComplexity:
         """Estimate task complexity using a scoring system.
@@ -270,59 +245,30 @@ class ModelRouter:
 
     def record_usage(self, cost: float) -> None:
         """Record a cost against the daily budget."""
+        import math
+        if not math.isfinite(cost) or cost < 0:
+            raise ValueError("Usage cost must be finite and nonnegative")
         self._daily_spend += cost
 
     def reset_daily_spend(self) -> None:
-        """Reset the daily spend counter (called by scheduler at midnight)."""
+        """Reset the built-in counter; an external daily source remains authoritative."""
         self._daily_spend = 0.0
 
     @property
     def daily_spend(self) -> float:
-        return self._daily_spend
+        import math
+        spend = self._daily_spend_provider() if self._daily_spend_provider else self._daily_spend
+        if not math.isfinite(spend) or spend < 0:
+            raise RoutingError("Daily usage source returned an invalid spend")
+        return spend
 
     @property
     def budget_remaining(self) -> float:
-        return max(0, self._config.daily_budget - self._daily_spend)
+        return max(0, self._config.daily_budget - self.daily_spend)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
-    def _route_with_provider(
-        self,
-        message: str,
-        provider: str,
-        has_tools: bool,
-        has_images: bool,
-        latency: LatencyTier,
-    ) -> RoutingDecision:
-        """Route within a specific provider."""
-        complexity = self.estimate_complexity(message, has_tools)
-        target_tier = _COMPLEXITY_TO_TIER.get(complexity, ModelTier.BALANCED)
-
-        candidates = [
-            m for m in ALL_MODELS.values()
-            if m.provider == provider and m.enabled
-            and (not has_tools or m.supports_tools)
-            and (not has_images or m.supports_vision)
-        ]
-
-        # Prefer matching tier
-        tier_matches = [m for m in candidates if m.tier == target_tier]
-        if tier_matches:
-            model = tier_matches[0]
-        elif candidates:
-            model = candidates[0]
-        else:
-            # Fall back to any model
-            model = list(ALL_MODELS.values())[0]
-
-        return RoutingDecision(
-            model=model,
-            reason=f"Forced provider: {provider} ({model.display_name})",
-            complexity=complexity,
-            estimated_cost=round(self._estimate_cost(model, message), 6),
-        )
 
     def _get_candidates(
         self,

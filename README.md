@@ -14,13 +14,17 @@ Extracted from [Koda AI](https://github.com/HeyKodaAI) ("the AI agent that never
 
 - **Complexity scoring** — combines multiple signals rather than bare keyword matching: complex/critical/casual keyword sets, multi-step patterns ("first... then...", numbered lists), deep-question patterns ("why does...", "compare..."), message length, sentence count, code detection, and tool usage. Maps to four levels: `simple`, `moderate`, `complex`, `critical`.
 - **Tier-based selection** — models are grouped into `fast`, `balanced`, and `powerful` tiers; complexity maps to a target tier, with configurable auto-upgrade and auto-downgrade.
-- **Cost budgets** — per-request and daily budget limits; requests that would exceed the per-request budget are automatically downgraded to a cheaper model.
+- **Cost budgets** — per-request and daily budget limits; requests that would exceed either limit use a cheaper compatible model or raise `RoutingError`.
 - **Fallback chains** — every decision includes up to three same-tier fallback models, ordered by a configurable provider preference (`["anthropic", "openai", "local"]` by default).
 - **Overrides** — force a specific model ID or pin all routing to one provider.
 - **Capability filtering** — models that don't support tools or vision are excluded when the request needs them.
 - **Built-in catalog** — Anthropic (Haiku/Sonnet/Opus), OpenAI (GPT-4o mini/GPT-4o/o1), and local Ollama models (Llama 3, Mixtral), each with pricing, context window, and capability metadata.
 - **Usage tracking** — SQLite-backed storage for routing config and per-call usage records, with cost summaries by provider and model.
 - **FastAPI routes** — a ready-made `APIRouter` exposing the router and usage data over HTTP.
+
+## Review fixes (0.1.1)
+
+See [CHANGELOG.md](CHANGELOG.md) for fixes, compatibility changes and upgrade guidance.
 
 ## Install
 
@@ -124,7 +128,7 @@ pip install -e . pytest pytest-asyncio
 pytest
 ```
 
-28 tests.
+43 tests.
 
 ## License
 

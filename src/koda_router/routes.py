@@ -17,11 +17,11 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from koda_router.catalog import ALL_MODELS, get_model, list_models, list_providers
 from koda_router.models import LatencyTier, RoutingConfig
-from koda_router.router import ModelRouter
+from koda_router.router import ModelRouter, RoutingError
 from koda_router.storage import RoutingStorage
 
 logger = logging.getLogger("koda_router.routes")
@@ -36,6 +36,7 @@ def init_routing_routes(storage: RoutingStorage, model_router: ModelRouter) -> N
     global _storage, _router
     _storage = storage
     _router = model_router
+    model_router.set_daily_spend_provider(storage.get_daily_cost)
 
 
 def _get_storage() -> RoutingStorage:
@@ -106,10 +107,10 @@ async def update_config(request: ConfigUpdateRequest) -> dict:
     config = storage.get_config()
     update_data = request.model_dump(exclude_none=True)
 
-    # Apply updates
-    for key, value in update_data.items():
-        if hasattr(config, key):
-            setattr(config, key, value)
+    try:
+        config = RoutingConfig.model_validate({**config.model_dump(), **update_data})
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail="Invalid routing configuration") from exc
 
     storage.save_config(config)
     model_router.config = config
@@ -127,13 +128,14 @@ async def estimate_model(request: EstimateRequest) -> dict:
     except ValueError:
         latency = LatencyTier.REALTIME
 
-    decision = model_router.route(
-        message=request.message,
-        has_tools=request.has_tools,
-        has_images=request.has_images,
-        latency=latency,
-        force_model=request.force_model,
-    )
+    try:
+        decision = model_router.route(
+            message=request.message, has_tools=request.has_tools,
+            has_images=request.has_images, latency=latency,
+            force_model=request.force_model,
+        )
+    except RoutingError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return {
         "model": decision.model.model_dump(),
